@@ -4,11 +4,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import subprocess
 import sys
 import random
 from typing import Optional
+
+# ─── Debug logging ────────────────────────────────────────────────────────────
+logging.basicConfig(
+    filename="/tmp/terminal-radio-debug.log",
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("terminal-radio")
 
 import httpx
 from textual import on, work
@@ -588,8 +597,10 @@ class EtherFM(App):
 
     @work(exclusive=True, thread=False)
     async def load_stations(self) -> None:
+        log.debug("load_stations: started")
         self._set_status("Fetching location…")
         cc = await self._get_location()
+        log.debug("load_stations: location cc=%r", cc)
         self.location = cc.upper() if cc else "??"
         try:
             self.query_one("#location-pill", Label).update(f"◉ {self.location}")
@@ -599,7 +610,9 @@ class EtherFM(App):
         self._set_status(f"Fetching stations for {self.location}…")
         stations = await self._fetch_stations(cc)
 
+        log.debug("load_stations: _fetch_stations returned %d stations", len(stations))
         if not stations:
+            log.error("load_stations: no stations returned — connection or API issue")
             self._set_status("API ERROR — no stations found", error=True)
             try:
                 self.query_one("#station-count", Label).update("ERROR")
@@ -645,39 +658,65 @@ class EtherFM(App):
         self._set_status(f"Loaded {count} stations", error=False)
 
     async def _get_location(self) -> str:
+        log.debug("_get_location: sending request to ip-api.com")
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 r = await client.get("http://ip-api.com/json")
+                log.debug("_get_location: HTTP %s", r.status_code)
                 data = r.json()
-                return data.get("countryCode", "").lower()
-        except Exception:
+                log.debug("_get_location: response data = %s", data)
+                cc = data.get("countryCode", "").lower()
+                log.debug("_get_location: countryCode = %r", cc)
+                return cc
+        except Exception as e:
+            log.error("_get_location: exception: %s", e)
             return ""
 
     async def _fetch_stations(self, cc: str) -> list[dict]:
+        log.debug("_fetch_stations: called with cc=%r", cc)
         stations = []
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 if cc:
                     url = f"https://de1.api.radio-browser.info/json/stations/bycountrycodeexact/{cc.upper()}"
+                    log.debug("_fetch_stations: fetching country URL: %s", url)
                     r = await client.get(url, params={
                         "limit": 40, "hidebroken": "true",
                         "order": "clickcount", "reverse": "true"
                     })
-                    stations = r.json()
+                    log.debug("_fetch_stations: country fetch HTTP %s", r.status_code)
+                    try:
+                        stations = r.json()
+                        log.debug("_fetch_stations: country stations count = %d", len(stations))
+                    except Exception as je:
+                        log.error("_fetch_stations: failed to parse country JSON: %s | body: %r", je, r.text[:200])
+                        stations = []
+                else:
+                    log.debug("_fetch_stations: no country code, skipping country fetch")
 
                 if len(stations) < 3:
+                    log.debug("_fetch_stations: fewer than 3 country stations (%d), fetching global topclick", len(stations))
                     r2 = await client.get(
                         "https://de1.api.radio-browser.info/json/stations/topclick",
                         params={"limit": 30, "hidebroken": "true"}
                     )
-                    extra = r2.json()
+                    log.debug("_fetch_stations: global topclick HTTP %s", r2.status_code)
+                    try:
+                        extra = r2.json()
+                        log.debug("_fetch_stations: global stations count = %d", len(extra))
+                    except Exception as je:
+                        log.error("_fetch_stations: failed to parse global JSON: %s | body: %r", je, r2.text[:200])
+                        extra = []
                     stations = stations + extra
 
         except Exception as e:
+            log.error("_fetch_stations: network exception: %s", e, exc_info=True)
             self._set_status(f"API ERROR: {e}", error=True)
             return []
 
+        log.debug("_fetch_stations: total before dedup = %d", len(stations))
         stations = deduplicate(stations)
+        log.debug("_fetch_stations: total after dedup = %d", len(stations))
         # Sort by clickcount desc
         stations.sort(key=lambda s: int(s.get("clickcount", 0) or 0), reverse=True)
         return stations
